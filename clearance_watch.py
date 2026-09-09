@@ -28,7 +28,7 @@ except ImportError:
 # CONFIG
 # ----------------------------------------------------------------------------
 
-CLEARANCE_URL = "https://www.sportsmans.com/deals-clearance/fishing-clearance/c/cat101209?q=%3Aprice-desc%3AdefaultParentCategory%3Acat101045%3AdefaultParentCategory%3Acat101039%3AdefaultParentCategory%3Acat101028%3AdefaultParentCategory%3Acat101036%3AdefaultParentCategory%3Acat101038%3AdefaultParentCategory%3Acat112005%3AdefaultParentCategory%3Acat112000%3AdefaultParentCategory%3Acat135701%3AdefaultParentCategory%3Acat135700%3AdefaultParentCategory%3Acat101051%3AdefaultParentCategory%3Acat101037%3AdefaultParentCategory%3Acat101052%3AdefaultParentCategory%3Acat101041%3AdefaultParentCategory%3Acat101034%3AdefaultParentCategory%3Acat101035%3AshipOption%3ASHIPTOYOU"
+CLEARANCE_URL = "https://www.sportsmans.com/deals-clearance/fishing-clearance/c/cat101209?q=%3Aprice-desc%3AdefaultParentCategory%3Acat101045%3AdefaultParentCategory%3Acat101039%3AdefaultParentCategory%3Acat101028%3AdefaultParentCategory%3Acat101036%3AdefaultParentCategory%3Acat101038%3AdefaultParentCategory%3Acat112005%3AdefaultParentCategory%3Acat112000%3AdefaultParentCategory%3Acat135701%3AdefaultParentCategory%3Acat135700%3AdefaultParentCategory%3Acat101051%3AdefaultParentCategory%3Acat101037%3AdefaultParentCategory%3Acat101052%3AdefaultParentCategory%3Acat101041%3AdefaultParentCategory%3Acat101034%3AdefaultParentCategory%3Acat101035%3AshipOption%3ASHIPTOYOU&page=0"
 
 KEYWORDS = []  # empty = every product the URL shows; the URL does the filtering
 
@@ -69,8 +69,20 @@ def _page_url(base, n):
     return f"{base}{sep}page={n}"
 
 
-def extract_from_dom(page):
-    """Pull product tiles from the currently-loaded DOM. Returns {name: item}."""
+def _money(raw):
+    if not raw:
+        return None
+    m = re.search(r"[\d,]+(?:\.\d{1,2})?", str(raw))
+    if not m:
+        return None
+    try:
+        return f"${float(m.group(0).replace(',', '')):.2f}"
+    except Exception:
+        return None
+
+
+def _anchor_fallback(page):
+    """Old method: read links whose visible text contains a price."""
     found = {}
     kw = [k.lower() for k in KEYWORDS]
     for a in page.query_selector_all("a"):
@@ -92,16 +104,53 @@ def extract_from_dom(page):
         if kw and not any(k in name.lower() for k in kw):
             continue
         uniq = sorted(set(prices), key=_to_float)
-        sale = uniq[0]
-        orig = uniq[-1] if len(uniq) > 1 else None
-        if href.startswith("http"):
-            url = href
-        elif href.startswith("/"):
-            url = "https://www.sportsmans.com" + href
-        else:
-            url = None
-        found[name] = {"name": name, "price": sale, "orig": orig, "url": url}
+        url = href if href.startswith("http") else ("https://www.sportsmans.com" + href if href.startswith("/") else None)
+        found[name] = {"name": name, "price": uniq[0], "orig": (uniq[-1] if len(uniq) > 1 else None), "url": url}
     return found
+
+
+def extract_from_dom(page):
+    """Read product tiles by their labeled data attributes (precise)."""
+    found = {}
+    kw = [k.lower() for k in KEYWORDS]
+    tiles = page.query_selector_all(".product-item")
+    if not tiles:
+        return _anchor_fallback(page)
+
+    for el in tiles:
+        try:
+            name = (el.get_attribute("data-cnstrc-item-name") or "").strip()
+            if not name:
+                a = el.query_selector("a.name")
+                name = (a.inner_text().strip() if a else "")
+            sale = _money(el.get_attribute("data-cnstrc-item-price"))
+            url_raw = el.get_attribute("data-product-url") or ""
+        except Exception:
+            continue
+        if not name:
+            continue
+        if kw and not any(k in name.lower() for k in kw):
+            continue
+
+        if not sale:
+            pe = el.query_selector(".smw-sale-price, .price")
+            if pe:
+                m = re.search(r"\$[\d,]+\.\d{2}", pe.inner_text() or "")
+                if m:
+                    sale = m.group(0)
+
+        orig = None
+        try:
+            strike = el.query_selector(".price-strikethrough")
+            if strike:
+                orig = _money(strike.inner_text())
+        except Exception:
+            pass
+
+        url = ("https://www.sportsmans.com" + url_raw) if url_raw.startswith("/") else (url_raw or None)
+        found[name] = {"name": name, "price": sale or "price n/a", "orig": orig, "url": url}
+    return found
+
 
 # ----------------------------------------------------------------------------
 # Browser: walk pages and collect everything
@@ -252,6 +301,15 @@ def main():
         return
 
     new_items = [current_items[n] for n in current if n not in previous]
+
+    # Safety: if most of the page looks 'new' (e.g. after a script update or a
+    # site redesign changed how items are identified), don't blast alerts -
+    # just quietly re-baseline this once.
+    if len(new_items) > 15 and len(new_items) >= 0.5 * max(1, len(current)):
+        print(f"{len(new_items)} of {len(current)} look new; treating as a re-baseline (no alerts).")
+        save_snapshot(current)
+        return
+
     new_items.sort(key=_by_discount)
 
     price_changes = []
