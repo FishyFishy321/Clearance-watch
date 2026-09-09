@@ -1,0 +1,47 @@
+name: Clearance Watch
+
+on:
+  schedule:
+    # Every 15 minutes. Times are UTC and GitHub may delay a few minutes.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:   # lets you run it manually from the Actions tab
+
+permissions:
+  contents: write      # needed so it can save the snapshot back to the repo
+
+concurrency:
+  group: clearance-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run clearance watch
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python clearance_watch.py
+
+      - name: Save snapshot back to repo
+        run: |
+          git config user.name "clearance-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add last_snapshot.json
+          if git diff --staged --quiet; then
+            echo "No snapshot changes to commit."
+          else
+            git commit -m "Update clearance snapshot [skip ci]"
+            git push
+          fi
