@@ -1,3 +1,6 @@
+Content is user-generated and unverified.
+1
+Learn about artifacts
 #!/usr/bin/env python3
 """
 clearance_watch.py
