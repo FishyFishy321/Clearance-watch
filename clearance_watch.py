@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
 """
-clearance_watch.py  (Playwright / real-browser version)
---------------------------------------------------------
-Loads the Sportsman's Warehouse clearance page in a headless browser so the
-page's JavaScript runs and the products actually appear, then reports what
-CHANGED since the last run (new items + price changes), sorted by percent off.
+clearance_watch.py
+------------------
+Checks Sportsman's Warehouse for fishing RODS / REELS on clearance and reports
+what CHANGED since the last run: NEW items and PRICE CHANGES, sorted by percent
+off retail (deepest discount first).
 
-Alerts go to Telegram when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
-
-If it finds 0 items, it saves the fully-rendered page to 'rendered_page.html'
-so the exact layout can be inspected and the parser tuned to match.
+Sends alerts to Telegram when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set
+(that's how the GitHub Actions cloud version notifies you). If they're not set,
+it just prints to the terminal (a-Shell) or fires a Pythonista notification.
 """
 
 import json
 import os
 import re
 import sys
+import html as html_lib
 
 try:
-    import requests  # used only for the Telegram alert
+    import requests
 except ImportError:
-    requests = None
-
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    print("Playwright isn't installed. The GitHub workflow installs it automatically.")
-    print("Locally you'd run:  pip install playwright && python -m playwright install chromium")
+    print("The 'requests' library is missing. In a-Shell run:  pip install requests")
     sys.exit(1)
 
 # ----------------------------------------------------------------------------
@@ -38,15 +32,18 @@ CLEARANCE_URL = "https://www.sportsmans.com/deals-clearance/fishing-clearance/c/
 KEYWORDS = ["rod", "reel", "combo"]
 
 STORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_snapshot.json")
-RENDERED_DUMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rendered_page.html")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 # ----------------------------------------------------------------------------
-# Helpers
+# Price / link helpers
 # ----------------------------------------------------------------------------
 
 def _to_float(price):
@@ -54,6 +51,21 @@ def _to_float(price):
         return float(str(price).replace("$", "").replace(",", ""))
     except Exception:
         return 0.0
+
+
+def _find_price(blob, keys):
+    for k in keys:
+        m = re.search(r'"' + k + r'"\s*:\s*"?\$?([\d,]+\.\d{2})', blob)
+        if m:
+            return "$" + m.group(1)
+    return None
+
+
+def _find_url(blob):
+    m = re.search(r'"(?:url|link|productUrl|canonicalUrl|@id)"\s*:\s*"(https?:\\?/\\?/[^"]+)"', blob)
+    if m:
+        return m.group(1).replace("\\/", "/")
+    return None
 
 
 def _pct_off(orig, sale):
@@ -67,99 +79,42 @@ def is_real_price(p):
     return isinstance(p, str) and p.startswith("$")
 
 # ----------------------------------------------------------------------------
-# Browser render + extraction
+# Core logic
 # ----------------------------------------------------------------------------
 
-def render_and_extract():
-    """
-    Opens the page in a headless browser, waits for products to render, and
-    pulls name/price/link from product tiles using a layout-agnostic method:
-    it reads each link's visible text and grabs any $ prices inside it.
-    Returns (products_list, rendered_html).
-    """
+def fetch(url):
+    resp = requests.get(url, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
+def extract_products(page):
+    """Returns list of dicts: {name, price, orig, pct_off, url}."""
     products = {}
-    html = ""
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1280, "height": 2000})
-        page.goto(CLEARANCE_URL, wait_until="domcontentloaded", timeout=60000)
-
-        # Give the JavaScript time to load products; wait until a price shows up.
-        try:
-            page.wait_for_function("document.body.innerText.includes('$')", timeout=20000)
-        except Exception:
-            pass
-        page.wait_for_timeout(4000)
-
-        # Scroll down to trigger any lazy-loaded tiles.
-        for _ in range(5):
-            page.mouse.wheel(0, 4000)
-            page.wait_for_timeout(800)
-
-        html = page.content()
-
-        # Diagnostics so we can see what the browser actually got.
-        try:
-            body_text = page.inner_text("body")
-        except Exception:
-            body_text = ""
-        try:
-            title = page.title()
-        except Exception:
-            title = ""
-        diag = {
-            "title": title,
-            "body_len": len(body_text),
-            "body_sample": body_text[:1500],
-            "anchor_count": len(page.query_selector_all("a")),
-            "price_count": len(re.findall(r"\$[\d,]+\.\d{2}", html)),
-            "html_len": len(html),
+    for match in re.finditer(r'\{[^{}]*?"name"\s*:\s*"([^"]{3,120})"[^{}]*?\}', page):
+        blob = match.group(0)
+        name = html_lib.unescape(match.group(1)).strip()
+        sale = _find_price(blob, ["salePrice", "currentPrice", "price"])
+        orig = _find_price(blob, ["listPrice", "regularPrice", "wasPrice",
+                                  "originalPrice", "msrp", "retailPrice"])
+        products[name] = {
+            "name": name,
+            "price": sale or "price n/a",
+            "orig": orig,
+            "url": _find_url(blob),
         }
 
-        # Layout-agnostic: examine every link's visible text.
-        for a in page.query_selector_all("a"):
-            try:
-                text = (a.inner_text() or "").strip()
-                href = a.get_attribute("href") or ""
-            except Exception:
-                continue
-            if not text:
-                continue
-            low = text.lower()
-            if not any(k in low for k in [k.lower() for k in KEYWORDS]):
-                continue
-            prices = re.findall(r"\$[\d,]+\.\d{2}", text)
-            if not prices:
-                continue
+    for match in re.finditer(r'"@type"\s*:\s*"Product".*?"name"\s*:\s*"([^"]{3,120})"', page, re.S):
+        name = html_lib.unescape(match.group(1)).strip()
+        products.setdefault(name, {"name": name, "price": "price n/a", "orig": None, "url": None})
 
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
-            name_lines = [l for l in lines if "$" not in l]
-            name = (name_lines[0] if name_lines else lines[0])[:120]
-
-            uniq = sorted(set(prices), key=_to_float)
-            sale = uniq[0]
-            orig = uniq[-1] if len(uniq) > 1 else None
-
-            if href.startswith("http"):
-                url = href
-            elif href.startswith("/"):
-                url = "https://www.sportsmans.com" + href
-            else:
-                url = None
-
-            products[name] = {"name": name, "price": sale, "orig": orig, "url": url}
-
-        browser.close()
-
-    result = list(products.values())
+    kw = [k.lower() for k in KEYWORDS]
+    result = [p for p in products.values() if any(k in p["name"].lower() for k in kw)]
     for p in result:
         p["pct_off"] = _pct_off(p.get("orig"), p.get("price"))
-    return result, html, diag
+    return result
 
-# ----------------------------------------------------------------------------
-# Snapshot + alerts
-# ----------------------------------------------------------------------------
 
 def load_snapshot():
     if not os.path.exists(STORE_FILE):
@@ -177,9 +132,10 @@ def save_snapshot(snapshot):
 
 
 def send_telegram(text):
+    """Send a message via Telegram bot. Returns True on success."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id or requests is None:
+    if not token or not chat_id:
         return False
     try:
         r = requests.post(
@@ -198,6 +154,12 @@ def send_telegram(text):
 def notify(text):
     if send_telegram(text):
         print("Alert sent to Telegram.")
+        return
+    try:
+        import notification  # Pythonista only
+        notification.schedule(text, delay=1)
+    except Exception:
+        pass  # a-Shell: the printed output above is the notification
 
 
 def _by_discount(item):
@@ -214,43 +176,29 @@ def _fmt(item):
         line += f"\n  {item['url']}"
     return line
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
 
 def main():
-    print("Loading clearance page in a headless browser...")
+    diagnose = "--diagnose" in sys.argv
+
+    print("Checking Sportsman's Warehouse clearance...")
     try:
-        products, html, diag = render_and_extract()
+        page = fetch(CLEARANCE_URL)
     except Exception as e:
-        print(f"Browser/render failed: {e}")
+        print(f"Could not reach the site: {e}")
         return
 
+    if diagnose:
+        with open("debug_page.html", "w") as f:
+            f.write(page)
+        print(f"Saved raw page to debug_page.html ({len(page):,} chars).")
+        print("Check for product names, original/was prices, and product URLs.")
+        return
+
+    products = extract_products(page)
     print(f"Found {len(products)} matching rod/reel items on the page.")
-
     if not products:
-        try:
-            with open(RENDERED_DUMP, "w") as f:
-                f.write(html)
-        except Exception:
-            pass
-        print("\n=== DIAGNOSTIC START ===")
-        print(f"page title      : {diag['title']}")
-        print(f"rendered HTML   : {diag['html_len']} chars")
-        print(f"visible text    : {diag['body_len']} chars")
-        print(f"links on page   : {diag['anchor_count']}")
-        print(f"prices ($) seen : {diag['price_count']}")
-        print("---- first 1500 chars of visible page text ----")
-        print(diag['body_sample'])
-        print("=== DIAGNOSTIC END ===")
+        print("Found 0 - page may be JavaScript-rendered. Try: --diagnose")
         return
-
-    # Clean up any stale debug dump once extraction works.
-    if os.path.exists(RENDERED_DUMP):
-        try:
-            os.remove(RENDERED_DUMP)
-        except Exception:
-            pass
 
     current_items = {p["name"]: p for p in products}
     current = {name: p["price"] for name, p in current_items.items()}
@@ -273,6 +221,7 @@ def main():
     price_changes.sort(key=lambda t: _by_discount(t[0]))
 
     report = []
+
     if new_items:
         print(f"\n*** {len(new_items)} NEW clearance item(s): ***")
         report.append(f"NEW clearance ({len(new_items)}):")
