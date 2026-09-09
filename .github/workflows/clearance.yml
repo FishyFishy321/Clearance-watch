@@ -38,7 +38,7 @@ jobs:
         run: |
           git config user.name "clearance-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add last_snapshot.json
+          git add last_snapshot.json 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "No snapshot changes to commit."
           else
