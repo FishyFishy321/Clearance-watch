@@ -1,49 +1,52 @@
 #!/usr/bin/env python3
 """
-clearance_watch.py
-------------------
-Checks Sportsman's Warehouse for fishing RODS / REELS on clearance and reports
-what CHANGED since the last run: NEW items and PRICE CHANGES, sorted by percent
-off retail (deepest discount first).
+clearance_watch.py  (Playwright, full-page load)
+------------------------------------------------
+Loads the Sportsman's Warehouse clearance page in a headless browser, loads
+ALL products (scrolls + clicks any Load More / Show More button until the
+count stops growing), then reports what CHANGED since the last run.
 
-Sends alerts to Telegram when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set
-(that's how the GitHub Actions cloud version notifies you). If they're not set,
-it just prints to the terminal (a-Shell) or fires a Pythonista notification.
+It trusts your URL to define what to watch, so scope the URL on the site
+(e.g. Rods + Reels categories, Clearance, Ship to Home) and this reports
+every product it shows. To narrow further by name, add words to KEYWORDS.
 """
 
 import json
 import os
 import re
 import sys
-import html as html_lib
 
 try:
-    import requests
+    import requests  # Telegram alert only
 except ImportError:
-    print("The 'requests' library is missing. In a-Shell run:  pip install requests")
+    requests = None
+
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    print("Playwright isn't installed. The GitHub workflow installs it automatically.")
     sys.exit(1)
 
 # ----------------------------------------------------------------------------
-# CONFIG  -- edit these
+# CONFIG
 # ----------------------------------------------------------------------------
 
 CLEARANCE_URL = "https://www.sportsmans.com/deals-clearance/fishing-clearance/c/cat101209?q=%3Aprice-desc%3AdefaultParentCategory%3Acat101045%3AdefaultParentCategory%3Acat101039%3AdefaultParentCategory%3Acat101028%3AdefaultParentCategory%3Acat101036%3AdefaultParentCategory%3Acat101038%3AdefaultParentCategory%3Acat112005%3AdefaultParentCategory%3Acat112000%3AdefaultParentCategory%3Acat135701%3AdefaultParentCategory%3Acat135700%3AdefaultParentCategory%3Acat101051%3AdefaultParentCategory%3Acat101037%3AdefaultParentCategory%3Acat101052%3AdefaultParentCategory%3Acat101041%3AdefaultParentCategory%3Acat101034%3AdefaultParentCategory%3Acat101035%3AshipOption%3ASHIPTOYOU"
 
-KEYWORDS = ["rod", "reel", "combo"]
+# Leave empty to report every product on the page (recommended, since your URL
+# already filters). Add words like ["rod", "reel"] only to narrow further.
+KEYWORDS = []
 
 STORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_snapshot.json")
+RENDERED_DUMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rendered_page.html")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 # ----------------------------------------------------------------------------
-# Price / link helpers
+# Helpers
 # ----------------------------------------------------------------------------
 
 def _to_float(price):
@@ -51,21 +54,6 @@ def _to_float(price):
         return float(str(price).replace("$", "").replace(",", ""))
     except Exception:
         return 0.0
-
-
-def _find_price(blob, keys):
-    for k in keys:
-        m = re.search(r'"' + k + r'"\s*:\s*"?\$?([\d,]+\.\d{2})', blob)
-        if m:
-            return "$" + m.group(1)
-    return None
-
-
-def _find_url(blob):
-    m = re.search(r'"(?:url|link|productUrl|canonicalUrl|@id)"\s*:\s*"(https?:\\?/\\?/[^"]+)"', blob)
-    if m:
-        return m.group(1).replace("\\/", "/")
-    return None
 
 
 def _pct_off(orig, sale):
@@ -79,42 +67,115 @@ def is_real_price(p):
     return isinstance(p, str) and p.startswith("$")
 
 # ----------------------------------------------------------------------------
-# Core logic
+# Browser render + full-page load + extraction
 # ----------------------------------------------------------------------------
 
-def fetch(url):
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+COUNT_JS = "() => Array.from(document.querySelectorAll('a')).filter(a => (a.innerText||'').includes('$')).length"
+
+CLICK_MORE_JS = """() => {
+    const rx = /(load more|show more|view more|see more|more results|more products)/i;
+    const els = Array.from(document.querySelectorAll('button, a'));
+    const b = els.find(e => rx.test((e.innerText || '').trim()) && e.offsetParent !== null);
+    if (b) { b.click(); return true; }
+    return false;
+}"""
 
 
-def extract_products(page):
-    """Returns list of dicts: {name, price, orig, pct_off, url}."""
+def render_and_extract():
     products = {}
+    diag = {}
 
-    for match in re.finditer(r'\{[^{}]*?"name"\s*:\s*"([^"]{3,120})"[^{}]*?\}', page):
-        blob = match.group(0)
-        name = html_lib.unescape(match.group(1)).strip()
-        sale = _find_price(blob, ["salePrice", "currentPrice", "price"])
-        orig = _find_price(blob, ["listPrice", "regularPrice", "wasPrice",
-                                  "originalPrice", "msrp", "retailPrice"])
-        products[name] = {
-            "name": name,
-            "price": sale or "price n/a",
-            "orig": orig,
-            "url": _find_url(blob),
-        }
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1366, "height": 2200})
+        page.goto(CLEARANCE_URL, wait_until="domcontentloaded", timeout=60000)
 
-    for match in re.finditer(r'"@type"\s*:\s*"Product".*?"name"\s*:\s*"([^"]{3,120})"', page, re.S):
-        name = html_lib.unescape(match.group(1)).strip()
-        products.setdefault(name, {"name": name, "price": "price n/a", "orig": None, "url": None})
+        try:
+            page.wait_for_function("document.body.innerText.includes('$')", timeout=20000)
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)
 
-    kw = [k.lower() for k in KEYWORDS]
-    result = [p for p in products.values() if any(k in p["name"].lower() for k in kw)]
-    for p in result:
-        p["pct_off"] = _pct_off(p.get("orig"), p.get("price"))
-    return result
+        # Load everything: scroll + click "load more" until the count is stable.
+        last, stable = -1, 0
+        for _ in range(50):
+            page.mouse.wheel(0, 6000)
+            page.wait_for_timeout(1100)
+            try:
+                clicked = page.evaluate(CLICK_MORE_JS)
+            except Exception:
+                clicked = False
+            if clicked:
+                page.wait_for_timeout(1600)
+            try:
+                cur = page.evaluate(COUNT_JS)
+            except Exception:
+                cur = last
+            if cur == last and not clicked:
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                stable = 0
+                last = cur
 
+        html = page.content()
+
+        try:
+            diag = {
+                "title": page.title(),
+                "html_len": len(html),
+                "anchor_count": len(page.query_selector_all("a")),
+                "price_count": len(re.findall(r"\$[\d,]+\.\d{2}", html)),
+                "body_sample": (page.inner_text("body") or "")[:1500],
+            }
+        except Exception:
+            diag = {}
+
+        kw = [k.lower() for k in KEYWORDS]
+        for a in page.query_selector_all("a"):
+            try:
+                text = (a.inner_text() or "").strip()
+                href = a.get_attribute("href") or ""
+            except Exception:
+                continue
+            if not text:
+                continue
+            prices = re.findall(r"\$[\d,]+\.\d{2}", text)
+            if not prices:
+                continue
+
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            name_lines = [l for l in lines if "$" not in l]
+            name = (name_lines[0] if name_lines else lines[0])[:120]
+            if len(name) < 5:
+                continue
+            if kw and not any(k in name.lower() for k in kw):
+                continue
+
+            uniq = sorted(set(prices), key=_to_float)
+            sale = uniq[0]
+            orig = uniq[-1] if len(uniq) > 1 else None
+
+            if href.startswith("http"):
+                url = href
+            elif href.startswith("/"):
+                url = "https://www.sportsmans.com" + href
+            else:
+                url = None
+
+            products[name] = {"name": name, "price": sale, "orig": orig, "url": url}
+
+        browser.close()
+
+    result = list(products.values())
+    for pr in result:
+        pr["pct_off"] = _pct_off(pr.get("orig"), pr.get("price"))
+    return result, html, diag
+
+# ----------------------------------------------------------------------------
+# Snapshot + alerts
+# ----------------------------------------------------------------------------
 
 def load_snapshot():
     if not os.path.exists(STORE_FILE):
@@ -132,10 +193,9 @@ def save_snapshot(snapshot):
 
 
 def send_telegram(text):
-    """Send a message via Telegram bot. Returns True on success."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
+    if not token or not chat_id or requests is None:
         return False
     try:
         r = requests.post(
@@ -154,12 +214,6 @@ def send_telegram(text):
 def notify(text):
     if send_telegram(text):
         print("Alert sent to Telegram.")
-        return
-    try:
-        import notification  # Pythonista only
-        notification.schedule(text, delay=1)
-    except Exception:
-        pass  # a-Shell: the printed output above is the notification
 
 
 def _by_discount(item):
@@ -176,28 +230,32 @@ def _fmt(item):
         line += f"\n  {item['url']}"
     return line
 
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
 
 def main():
-    diagnose = "--diagnose" in sys.argv
-
-    print("Checking Sportsman's Warehouse clearance...")
+    print("Loading clearance page in a headless browser (loading all items)...")
     try:
-        page = fetch(CLEARANCE_URL)
+        products, html, diag = render_and_extract()
     except Exception as e:
-        print(f"Could not reach the site: {e}")
+        print(f"Browser/render failed: {e}")
         return
 
-    if diagnose:
-        with open("debug_page.html", "w") as f:
-            f.write(page)
-        print(f"Saved raw page to debug_page.html ({len(page):,} chars).")
-        print("Check for product names, original/was prices, and product URLs.")
-        return
+    print(f"Found {len(products)} product items on the page.")
 
-    products = extract_products(page)
-    print(f"Found {len(products)} matching rod/reel items on the page.")
     if not products:
-        print("Found 0 - page may be JavaScript-rendered. Try: --diagnose")
+        try:
+            with open(RENDERED_DUMP, "w") as f:
+                f.write(html)
+        except Exception:
+            pass
+        print("\n=== DIAGNOSTIC START ===")
+        for k in ("title", "html_len", "anchor_count", "price_count"):
+            print(f"{k}: {diag.get(k)}")
+        print("---- first 1500 chars of visible page text ----")
+        print(diag.get("body_sample", ""))
+        print("=== DIAGNOSTIC END ===")
         return
 
     current_items = {p["name"]: p for p in products}
@@ -221,7 +279,6 @@ def main():
     price_changes.sort(key=lambda t: _by_discount(t[0]))
 
     report = []
-
     if new_items:
         print(f"\n*** {len(new_items)} NEW clearance item(s): ***")
         report.append(f"NEW clearance ({len(new_items)}):")
@@ -245,7 +302,7 @@ def main():
         notify("\n".join(report))
 
     save_snapshot(current)
-    print("\nSaved snapshot for next time.")
+    print(f"\nSaved snapshot ({len(current)} items) for next time.")
 
 
 if __name__ == "__main__":
