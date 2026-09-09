@@ -1,6 +1,3 @@
-Content is user-generated and unverified.
-1
-Learn about artifacts
 #!/usr/bin/env python3
 """
 clearance_watch.py
@@ -30,7 +27,7 @@ except ImportError:
 # CONFIG  -- edit these
 # ----------------------------------------------------------------------------
 
-CLEARANCE_URL = "https://www.sportsmans.com/deals-clearance/fishing-clearance/c/cat101209?q=%3Aprice-desc%3AdefaultParentCategory%3Acat101045%3AdefaultParentCategory%3Acat101039%3AdefaultParentCategory%3Acat101028%3AdefaultParentCategory%3Acat101036%3AdefaultParentCategory%3Acat101038%3AdefaultParentCategory%3Acat112005%3AdefaultParentCategory%3Acat112000%3AdefaultParentCategory%3Acat135701%3AdefaultParentCategory%3Acat135700%3AdefaultParentCategory%3Acat101051%3AdefaultParentCategory%3Acat101037%3AdefaultParentCategory%3Acat101052%3AdefaultParentCategory%3Acat101041%3AdefaultParentCategory%3Acat101034%3AdefaultParentCategory%3Acat101035%3AshipOption%3ASHIPTOYOU"
+CLEARANCE_URL = "https://www.sportsmans.com/fishing/c/cat101026?facet=Clearance"
 
 KEYWORDS = ["rod", "reel", "combo"]
 
