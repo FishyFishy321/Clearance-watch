@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-clearance_watch.py  (Playwright, page-by-page)
-----------------------------------------------
-Loads the Sportsman's Warehouse clearance URL page by page (adds &page=0,
-&page=1, ... until a page adds nothing new), collects every product, and
-reports what CHANGED since the last run: new items + price changes, sorted
-by percent off retail. Alerts go to Telegram.
+clearance_watch.py  (Playwright, page-by-page with tile-wait)
+-------------------------------------------------------------
+Walks the Sportsman's Warehouse clearance URL page by page (&page=0, 1, 2 ...),
+waiting on each page for the real product tiles to render before reading them.
+Reads each tile's labeled data attributes (name, sale price, link) plus the
+strikethrough "was" price, then reports what CHANGED since the last run:
+new items + price changes, sorted by percent off. Alerts go to Telegram.
 """
 
 import json
@@ -30,7 +31,8 @@ except ImportError:
 
 CLEARANCE_URL = "https://www.sportsmans.com/deals-clearance/fishing-clearance/c/cat101209?q=%3Aprice-desc%3AdefaultParentCategory%3Acat101045%3AdefaultParentCategory%3Acat101039%3AdefaultParentCategory%3Acat101028%3AdefaultParentCategory%3Acat101036%3AdefaultParentCategory%3Acat101038%3AdefaultParentCategory%3Acat112005%3AdefaultParentCategory%3Acat112000%3AdefaultParentCategory%3Acat135701%3AdefaultParentCategory%3Acat135700%3AdefaultParentCategory%3Acat101051%3AdefaultParentCategory%3Acat101037%3AdefaultParentCategory%3Acat101052%3AdefaultParentCategory%3Acat101041%3AdefaultParentCategory%3Acat101034%3AdefaultParentCategory%3Acat101035%3AshipOption%3ASHIPTOYOU&page=0"
 
-KEYWORDS = []  # empty = every product the URL shows; the URL does the filtering
+KEYWORDS = []      # empty = every product the URL shows (the URL does the filtering)
+MAX_PAGES = 20     # safety cap
 
 STORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_snapshot.json")
 RENDERED_DUMP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rendered_page.html")
@@ -62,6 +64,11 @@ def is_real_price(p):
     return isinstance(p, str) and p.startswith("$")
 
 
+def _page_url(base, n):
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}page={n}"
+
+
 def _money(raw):
     if not raw:
         return None
@@ -73,9 +80,12 @@ def _money(raw):
     except Exception:
         return None
 
+# ----------------------------------------------------------------------------
+# Extraction
+# ----------------------------------------------------------------------------
 
 def _anchor_fallback(page):
-    """Old method: read links whose visible text contains a price."""
+    """Fallback if labeled tiles ever disappear: links whose text has a price."""
     found = {}
     kw = [k.lower() for k in KEYWORDS]
     for a in page.query_selector_all("a"):
@@ -144,27 +154,29 @@ def extract_from_dom(page):
         found[name] = {"name": name, "price": sale or "price n/a", "orig": orig, "url": url}
     return found
 
-
 # ----------------------------------------------------------------------------
-# Browser: load one page, reveal all items, collect everything
+# Browser: walk pages, waiting for tiles to render on each
 # ----------------------------------------------------------------------------
 
-TILE_COUNT_JS = "() => document.querySelectorAll('.product-item').length"
-
-CLICK_MORE_JS = """() => {
-    const rx = /(show more|load more|view more|see more|more product|more result)/i;
-    let els = Array.from(document.querySelectorAll('button, a'));
-    let b = els.find(e => rx.test((e.innerText || '').trim()) && e.offsetParent !== null);
-    if (b) { b.scrollIntoView({block: 'center'}); b.click(); return 'text'; }
-    const sels = ['.js-show-more', '.js-load-more', '[class*=\"show-more\"]',
-                  '[class*=\"load-more\"]', 'a[rel=\"next\"]',
-                  '.pagination a.next', '.pagination__next'];
-    for (const sel of sels) {
-        const el = document.querySelector(sel);
-        if (el && el.offsetParent !== null) { el.scrollIntoView({block: 'center'}); el.click(); return sel; }
-    }
-    return '';
-}"""
+def _load_page(page, url):
+    """Navigate and wait until real product tiles render (with one retry)."""
+    for attempt in range(2):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_selector(".product-item", timeout=15000)
+            page.wait_for_timeout(1500)
+            for _ in range(3):
+                page.mouse.wheel(0, 5000)
+                page.wait_for_timeout(500)
+            return True
+        except Exception:
+            if attempt == 0:
+                page.wait_for_timeout(2000)  # slow load: wait, then retry once
+                continue
+    return False
 
 
 def render_and_extract():
@@ -174,53 +186,38 @@ def render_and_extract():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1366, "height": 2200})
-        page.goto(CLEARANCE_URL, wait_until="domcontentloaded", timeout=60000)
-        try:
-            page.wait_for_function("document.body.innerText.includes('$')", timeout=20000)
-        except Exception:
-            pass
-        page.wait_for_timeout(2500)
 
-        last, stable = -1, 0
-        for _ in range(45):
-            # accumulate whatever is currently loaded (robust to append or replace)
-            products.update(extract_from_dom(page))
-            cur = len(products)
-            if cur != last:
-                print(f"  {cur} products loaded...")
+        for n in range(MAX_PAGES):
+            ok = _load_page(page, _page_url(CLEARANCE_URL, n))
 
-            try:
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            except Exception:
-                pass
-            page.wait_for_timeout(900)
-            try:
-                clicked = page.evaluate(CLICK_MORE_JS)
-            except Exception:
-                clicked = ""
-            if clicked:
-                page.wait_for_timeout(1600)
+            if n == 0:
+                first_html = page.content()
+                try:
+                    diag = {
+                        "title": page.title(),
+                        "html_len": len(first_html),
+                        "product_item_count": len(page.query_selector_all(".product-item")),
+                        "price_count": len(re.findall(r"\$[\d,]+\.\d{2}", first_html)),
+                        "body_sample": (page.inner_text("body") or "")[:1500],
+                    }
+                except Exception:
+                    diag = {}
 
-            if cur == last and not clicked:
-                stable += 1
-                if stable >= 3:
-                    break
-            else:
-                stable = 0
-                last = cur
+            if not ok:
+                if n == 0:
+                    break            # first page never rendered -> real problem
+                else:
+                    break            # ran past the last page
 
-        products.update(extract_from_dom(page))  # final sweep
-        first_html = page.content()
-        try:
-            diag = {
-                "title": page.title(),
-                "html_len": len(first_html),
-                "product_item_count": page.evaluate(TILE_COUNT_JS),
-                "price_count": len(re.findall(r"\$[\d,]+\.\d{2}", first_html)),
-                "body_sample": (page.inner_text("body") or "")[:1500],
-            }
-        except Exception:
-            diag = {}
+            before = len(products)
+            page_items = extract_from_dom(page)
+            if not page_items:
+                break
+            products.update(page_items)
+            gained = len(products) - before
+            print(f"  page {n}: {len(page_items)} tiles, +{gained} new (total {len(products)})")
+            if gained == 0:
+                break                 # nothing new -> reached the end
 
         browser.close()
 
@@ -228,7 +225,6 @@ def render_and_extract():
     for pr in result:
         pr["pct_off"] = _pct_off(pr.get("orig"), pr.get("price"))
     return result, first_html, diag
-
 
 # ----------------------------------------------------------------------------
 # Snapshot + alerts
@@ -326,9 +322,8 @@ def main():
 
     new_items = [current_items[n] for n in current if n not in previous]
 
-    # Safety: if most of the page looks 'new' (e.g. after a script update or a
-    # site redesign changed how items are identified), don't blast alerts -
-    # just quietly re-baseline this once.
+    # Safety: if most of the page looks 'new' (after a script update or a site
+    # change to how items are identified), don't spam - just re-baseline once.
     if len(new_items) > 15 and len(new_items) >= 0.5 * max(1, len(current)):
         print(f"{len(new_items)} of {len(current)} look new; treating as a re-baseline (no alerts).")
         save_snapshot(current)
