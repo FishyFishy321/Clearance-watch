@@ -29,7 +29,7 @@ except ImportError:
 # CONFIG
 # ----------------------------------------------------------------------------
 
-CLEARANCE_URL = "https://www.sportsmans.com/deals-clearance/fishing-clearance/c/cat101209?q=%3Aprice-desc%3AdefaultParentCategory%3Acat101045%3AdefaultParentCategory%3Acat101039%3AdefaultParentCategory%3Acat101028%3AdefaultParentCategory%3Acat101036%3AdefaultParentCategory%3Acat101038%3AdefaultParentCategory%3Acat112005%3AdefaultParentCategory%3Acat112000%3AdefaultParentCategory%3Acat135701%3AdefaultParentCategory%3Acat135700%3AdefaultParentCategory%3Acat101051%3AdefaultParentCategory%3Acat101037%3AdefaultParentCategory%3Acat101052%3AdefaultParentCategory%3Acat101041%3AdefaultParentCategory%3Acat101034%3AdefaultParentCategory%3Acat101035%3AshipOption%3ASHIPTOYOU&page=0"
+CLEARANCE_URL = "https://www.sportsmans.com/fishing/c/cat101026?facet=Clearance"
 
 KEYWORDS = []      # empty = every product the URL shows (the URL does the filtering)
 MAX_PAGES = 20     # safety cap
@@ -67,6 +67,15 @@ def is_real_price(p):
 def _page_url(base, n):
     sep = "&" if "?" in base else "?"
     return f"{base}{sep}page={n}"
+
+
+def _sort_variants(url):
+    """Same search sorted both ways, so two first-pages cover the whole list."""
+    if "price-desc" in url:
+        return [url, url.replace("price-desc", "price-asc")]
+    if "price-asc" in url:
+        return [url, url.replace("price-asc", "price-desc")]
+    return [url]
 
 
 def _money(raw):
@@ -187,37 +196,37 @@ def render_and_extract():
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(user_agent=USER_AGENT, viewport={"width": 1366, "height": 2200})
 
-        for n in range(MAX_PAGES):
-            ok = _load_page(page, _page_url(CLEARANCE_URL, n))
+        starts = _sort_variants(CLEARANCE_URL)
+        for si, start in enumerate(starts):
+            for n in range(MAX_PAGES):
+                ok = _load_page(page, _page_url(start, n))
 
-            if n == 0:
-                first_html = page.content()
-                try:
-                    diag = {
-                        "title": page.title(),
-                        "html_len": len(first_html),
-                        "product_item_count": len(page.query_selector_all(".product-item")),
-                        "price_count": len(re.findall(r"\$[\d,]+\.\d{2}", first_html)),
-                        "body_sample": (page.inner_text("body") or "")[:1500],
-                    }
-                except Exception:
-                    diag = {}
+                if si == 0 and n == 0:
+                    first_html = page.content()
+                    try:
+                        diag = {
+                            "title": page.title(),
+                            "html_len": len(first_html),
+                            "product_item_count": len(page.query_selector_all(".product-item")),
+                            "price_count": len(re.findall(r"\$[\d,]+\.\d{2}", first_html)),
+                            "body_sample": (page.inner_text("body") or "")[:1500],
+                        }
+                    except Exception:
+                        diag = {}
 
-            if not ok:
-                if n == 0:
-                    break            # first page never rendered -> real problem
-                else:
-                    break            # ran past the last page
+                if not ok:
+                    break             # first page didn't render, or past the end
 
-            before = len(products)
-            page_items = extract_from_dom(page)
-            if not page_items:
-                break
-            products.update(page_items)
-            gained = len(products) - before
-            print(f"  page {n}: {len(page_items)} tiles, +{gained} new (total {len(products)})")
-            if gained == 0:
-                break                 # nothing new -> reached the end
+                before = len(products)
+                page_items = extract_from_dom(page)
+                if not page_items:
+                    break
+                products.update(page_items)
+                gained = len(products) - before
+                label = "high-to-low" if si == 0 else "low-to-high"
+                print(f"  [{label}] page {n}: {len(page_items)} tiles, +{gained} new (total {len(products)})")
+                if gained == 0:
+                    break             # this sort/page added nothing new
 
         browser.close()
 
